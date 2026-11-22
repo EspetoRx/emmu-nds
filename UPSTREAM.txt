@@ -1,0 +1,32 @@
+Upstream: https://github.com/Kelpsyberry/dust
+Commit: 76d79f25e4ea3ce355c4ac868f5ac9a233e64b89 (2025-12-17)
+License: GNU General Public License v3.0 (GPL-3.0), LICENSE copied from upstream
+
+Files vendored from upstream (do not edit):
+- vendor/dust/core/        (dust-core — CPU, GPU, APU, scheduler, save states)
+- vendor/dust/render/      (soft-2d, soft-2d/base, soft-3d renderers)
+- vendor/dust/game_db.json (save-type database)
+- vendor/dust/LICENSE
+
+Build-time dependencies of dust-core, also vendored at the exact revisions
+pinned by upstream Cargo.lock:
+- https://github.com/kelpsyberry/emu-utils @ fff4bcd769b2fd1b452d79aad7d7741589e64c0a
+- https://github.com/kelpsyberry/arm-decoder @ f853ca666532cc2fbd58e5760d98afbb47660655
+Neither upstream repository ships a separate LICENSE file or declares an SPDX
+identifier. They are distributed here only as build inputs of dust, which is
+GPL-3.0; the whole resulting work follows the GPL-3.0-only license of this crate.
+
+Local modifications (outside vendor/):
+- src/wasm.rs          — Emmu WASM facade: RGBA8888 stacked frame, f32 stereo
+                         audio queue, button/touch input, EMMUNDS1 save states,
+                         cartridge save RAM import/export and reset.
+- src/renderer_3d.rs   — synchronous in-thread 3D scanline renderer, replacing
+                         the upstream Web Worker + atomics + shared-memory path
+                         so the core works without COOP/COEP headers.
+- js/adapter.js        — worker protocol adapter (object output with frame and
+                         audio metadata), copied to the UI at build time.
+- rust-toolchain.toml  — pins nightly-2025-12-15, the toolchain compatible with
+                         the `proc-bitfield` nightly feature used upstream.
+
+No copyrightable Nintendo BIOS or firmware is bundled: dust uses an HLE BIOS
+and generates the default firmware at runtime.
