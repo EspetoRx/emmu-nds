@@ -18,20 +18,31 @@ like the N64 exception.
 - `setTouch(x, y)` / `endTouch()` — lower-screen touch panel.
 - `audio(maxSamples): Float32Array` — interleaved stereo PCM, 32.768 kHz (the native rate of `dust-core` without `xq-audio`).
 - `setVolume(volume)` — 0.0..1.0.
-- `saveState(): Uint8Array` — `EMMUNDS1` + u32 version + dust savestate.
-- `loadState(bytes)` — validates magic and version before loading.
+- `saveState(): Uint8Array` — `EMMUNDS1` + u32 version + dust savestate + cartridge save RAM.
+- `loadState(bytes)` — validates magic/version and restores the save RAM.
 - `exportSave(): Uint8Array` / `importSave(bytes)` — cartridge save RAM.
 - `restart()` — rebuilds the emulator preserving ROM, save RAM and renderers.
 
 ## Save states
 
-Magic `EMMUNDS1` + little-endian u32 version + the bincode-like savestate
-produced by `PersistentWriteSavestate`. Version is bumped whenever the vendored
-core changes its savestate layout. Invalid magic or version is rejected.
+Magic `EMMUNDS1` + little-endian u32 version (currently `2`) + two length-
+prefixed sections: the savestate produced by `PersistentWriteSavestate` and the
+raw cartridge save RAM. Version 1 states are still accepted for recovery; they
+have no save RAM section. Invalid magic, version or lengths are rejected.
+
+`dust-core` marks the raw save RAM fields with `#[savestate(skip)]`, so without
+the appended section an in-game save would be lost whenever the state was
+reloaded (new core instance, app reload, save-state history). The save RAM is
+now captured and restored together with each state.
 
 Cartridge save RAM uses the save type from `vendor/dust/game_db.json` (matched
 by ROM game code). NAND saves are not supported by dust and fall back to no
-save, matching upstream behavior.
+save, matching upstream behavior. Game codes starting with `I` (Pokémon
+Black/White and other IR cartridges) enable the IR-aware flash protocol, exactly
+as dust's own desktop/web frontends do. Note that the pinned dust commit still
+shows "The save data could not be accessed" with 256 MiB NDSi Enhanced dumps
+such as Pokémon White in both upstream frontends; this is a core limitation,
+not a save-state envelope problem.
 
 ## Rendering
 

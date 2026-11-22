@@ -143,7 +143,99 @@ impl dust_core::audio::Backend for AudioBackend {
     }
 }
 
-fn make_ds_slot_spi(save_kind: SaveKind, contents: Option<BoxedByteSlice>) -> ds_slot::spi::Spi {
+/// Cartridges whose game code starts with `I` (Pokémon Black/White, etc.) use
+/// the IR-aware SPI protocol: their commands are prefixed with a `0x00` byte.
+/// Reporting `has_ir = false` makes the game read that prefix as a flash
+/// command and show "The save data could not be accessed" before booting.
+fn cartridge_has_ir(game_code: u32) -> bool {
+    game_code as u8 == b'I'
+}
+
+/// Encode Emmu's save state envelope. `dust-core`'s persistent savestate skips
+/// the cartridge save RAM (`#[savestate(skip)]`), so it is stored here too;
+/// otherwise in-game saves are lost whenever the state is reloaded.
+fn encode_state(body: &[u8], save: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SAVE_MAGIC.len() + 12 + body.len() + save.len());
+    out.extend_from_slice(SAVE_MAGIC);
+    out.extend_from_slice(&SAVE_VERSION.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+    out.extend_from_slice(&(save.len() as u32).to_le_bytes());
+    out.extend_from_slice(save);
+    out
+}
+
+struct DecodedState<'a> {
+    body: &'a [u8],
+    save: Option<&'a [u8]>,
+}
+
+/// Decode a save state envelope. Version 1 is accepted for recovery; it has no
+/// cartridge save RAM section and no explicit body length.
+fn decode_state(bytes: &[u8]) -> Result<DecodedState<'_>, String> {
+    let header = SAVE_MAGIC.len() + 4;
+    if bytes.len() < header || &bytes[..SAVE_MAGIC.len()] != SAVE_MAGIC {
+        return Err("Save state DS inválido (magic)".to_string());
+    }
+    let version = u32::from_le_bytes([
+        bytes[SAVE_MAGIC.len()],
+        bytes[SAVE_MAGIC.len() + 1],
+        bytes[SAVE_MAGIC.len() + 2],
+        bytes[SAVE_MAGIC.len() + 3],
+    ]);
+    match version {
+        1 => Ok(DecodedState {
+            body: &bytes[header..],
+            save: None,
+        }),
+        2 => {
+            if bytes.len() < header + 4 {
+                return Err("Save state DS truncado (tamanho do corpo)".to_string());
+            }
+            let body_len = u32::from_le_bytes([
+                bytes[header],
+                bytes[header + 1],
+                bytes[header + 2],
+                bytes[header + 3],
+            ]) as usize;
+            let body_start = header + 4;
+            let save_len_pos = body_start
+                .checked_add(body_len)
+                .ok_or_else(|| "Save state DS inválido (tamanho do corpo)".to_string())?;
+            let save_pos = save_len_pos
+                .checked_add(4)
+                .ok_or_else(|| "Save state DS inválido (tamanho do save)".to_string())?;
+            if bytes.len() < save_pos {
+                return Err("Save state DS truncado (corpo)".to_string());
+            }
+            let save_len = u32::from_le_bytes([
+                bytes[save_len_pos],
+                bytes[save_len_pos + 1],
+                bytes[save_len_pos + 2],
+                bytes[save_len_pos + 3],
+            ]) as usize;
+            let save_end = save_pos
+                .checked_add(save_len)
+                .ok_or_else(|| "Save state DS inválido (tamanho do save)".to_string())?;
+            if save_end != bytes.len() {
+                return Err("Save state DS inválido (tamanho do save)".to_string());
+            }
+            Ok(DecodedState {
+                body: &bytes[body_start..save_len_pos],
+                save: Some(&bytes[save_pos..save_end]),
+            })
+        }
+        other => Err(format!(
+            "Save state DS incompatível: versão {other} != {SAVE_VERSION}"
+        )),
+    }
+}
+
+fn make_ds_slot_spi(
+    save_kind: SaveKind,
+    contents: Option<BoxedByteSlice>,
+    has_ir: bool,
+) -> ds_slot::spi::Spi {
     let Some(kind) = (match save_kind {
         SaveKind::None => None,
         other => Some(other),
@@ -176,7 +268,7 @@ fn make_ds_slot_spi(save_kind: SaveKind, contents: Option<BoxedByteSlice>) -> ds
                 .into()
         }
         SaveKind::Flash2m | SaveKind::Flash4m | SaveKind::Flash8m => {
-            ds_slot::spi::flash::Flash::new(contents, [0; 20], false)
+            ds_slot::spi::flash::Flash::new(contents, [0; 20], has_ir)
                 .expect("FLASH")
                 .into()
         }
@@ -209,9 +301,10 @@ impl NdsEmulator {
         let audio_backend = Box::new(AudioBackend {
             buffer: audio_buffer.clone(),
         });
-        let model = Model::Ds;
+        let model = Model::Lite;
 
         let game_code = u32::from_le_bytes([rom[0x0c], rom[0x0d], rom[0x0e], rom[0x0f]]);
+        let has_ir = cartridge_has_ir(game_code);
         let save_kind = serde_json::from_str::<Vec<GameDbEntry>>(GAME_DB)
             .ok()
             .and_then(|db| db.into_iter().find(|entry| entry.code == game_code))
@@ -231,7 +324,7 @@ impl NdsEmulator {
             )
             .expect("default firmware"),
             Some(Box::new(rom_bytes)),
-            make_ds_slot_spi(save_kind, None),
+            make_ds_slot_spi(save_kind, None, has_ir),
             audio_backend,
             None,
             Box::new(rtc::DummyBackend),
@@ -367,41 +460,39 @@ impl NdsEmulator {
         self.audio_buffer.lock().unwrap().clear();
     }
 
-    /// Serialize the emulation state with the `EMMUNDS1` magic prefix.
+    /// Serialize the emulation state with the `EMMUNDS1` magic prefix and the
+    /// cartridge save RAM appended (dust-core skips it in its own savestate).
     #[wasm_bindgen(js_name = saveState)]
     pub fn save_state(&mut self) -> Result<Uint8Array, JsValue> {
         let mut body = Vec::new();
         PersistentWriteSavestate::new(&mut body)
             .store(self.emu.as_mut().unwrap())
             .map_err(|e| JsValue::from_str(&format!("Falha ao salvar estado DS: {e:?}")))?;
-        let mut out = Vec::with_capacity(SAVE_MAGIC.len() + 4 + body.len());
-        out.extend_from_slice(SAVE_MAGIC);
-        out.extend_from_slice(&SAVE_VERSION.to_le_bytes());
-        out.extend_from_slice(&body);
+        let save = self.emu.as_ref().unwrap().ds_slot.spi.contents().to_vec();
+        let out = encode_state(&body, &save);
         Ok(Uint8Array::from(&out[..]))
     }
 
     /// Load a state, validating magic and version before touching the core.
+    /// Version 2 also restores the cartridge save RAM captured with the state.
     #[wasm_bindgen(js_name = loadState)]
     pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
-        let header = SAVE_MAGIC.len() + 4;
-        if bytes.len() < header || &bytes[..SAVE_MAGIC.len()] != SAVE_MAGIC {
-            return Err(JsValue::from_str("Save state DS inválido (magic)"));
-        }
-        let version = u32::from_le_bytes([
-            bytes[SAVE_MAGIC.len()],
-            bytes[SAVE_MAGIC.len() + 1],
-            bytes[SAVE_MAGIC.len() + 2],
-            bytes[SAVE_MAGIC.len() + 3],
-        ]);
-        if version != SAVE_VERSION {
-            return Err(JsValue::from_str(&format!(
-                "Save state DS incompatível: versão {version} != {SAVE_VERSION}"
-            )));
-        }
-        PersistentReadSavestate::new(&bytes[header..])
+        let decoded = decode_state(bytes).map_err(|message| JsValue::from_str(&message))?;
+        PersistentReadSavestate::new(decoded.body)
             .and_then(|mut state| state.load_into(self.emu.as_mut().unwrap()).map_err(drop))
             .map_err(|e| JsValue::from_str(&format!("Falha ao carregar estado DS: {e:?}")))?;
+        if let Some(save) = decoded.save {
+            let expected = self.save_kind.expected_len().unwrap_or(save.len());
+            let mut contents = BoxedByteSlice::new_zeroed(expected);
+            let copy_len = contents.len().min(save.len());
+            contents[..copy_len].copy_from_slice(&save[..copy_len]);
+            self.emu
+                .as_mut()
+                .unwrap()
+                .ds_slot
+                .spi
+                .reload_contents(SaveReloadContents::Existing(contents));
+        }
         self.audio_buffer.lock().unwrap().clear();
         Ok(())
     }
@@ -434,4 +525,53 @@ impl NdsEmulator {
 
     #[wasm_bindgen(js_name = setPaused)]
     pub fn set_paused(&mut self, _paused: bool) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ir_cartridges_are_detected_from_game_code() {
+        // "IRAO" (Pokémon White), stored little-endian at ROM offset 0x0C.
+        assert!(cartridge_has_ir(0x4F41_5249));
+        // "IRBJ" (Pokémon Black) and "IRBO" also start with 'I'.
+        assert!(cartridge_has_ir(0x4A42_5249));
+        // "A2DE" (New Super Mario Bros.) must keep the plain flash protocol.
+        assert!(!cartridge_has_ir(0x4544_3241));
+    }
+
+    #[test]
+    fn state_envelope_round_trips_body_and_save_ram() {
+        let bytes = encode_state(&[1, 2, 3, 4], &[0xAA, 0xBB]);
+        let decoded = decode_state(&bytes).expect("decode state");
+        assert_eq!(decoded.body, &[1, 2, 3, 4]);
+        assert_eq!(decoded.save, Some(&[0xAA, 0xBB][..]));
+    }
+
+    #[test]
+    fn legacy_state_without_save_ram_is_accepted() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SAVE_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&[9, 8, 7]);
+        let decoded = decode_state(&bytes).expect("decode legacy state");
+        assert_eq!(decoded.body, &[9, 8, 7]);
+        assert_eq!(decoded.save, None);
+    }
+
+    #[test]
+    fn invalid_states_are_rejected() {
+        let mut bad_magic = encode_state(&[1], &[2]);
+        bad_magic[0] = b'X';
+        assert!(decode_state(&bad_magic).is_err());
+
+        let mut bad_version = encode_state(&[1], &[2]);
+        bad_version[SAVE_MAGIC.len()] = 9;
+        assert!(decode_state(&bad_version).is_err());
+
+        let mut truncated = encode_state(&[1, 2, 3], &[4, 5]);
+        truncated.pop();
+        assert!(decode_state(&truncated).is_err());
+    }
 }
